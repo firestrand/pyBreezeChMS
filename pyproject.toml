@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyBreezeChMS"
+version = "2.0.0"
+description = "Python interface to the BreezeChMS REST API"
+readme = "README.rst"
+requires-python = ">=3.14,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "Alex Ortiz-Rosado"}]
+dependencies = ["requests>=2.34.2,<3"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.14",
+]
+
+[project.urls]
+Repository = "https://github.com/firestrand/pyBreezeChMS"
+Upstream = "https://github.com/alexortizrosado/pyBreezeChMS"
+
+[dependency-groups]
+dev = [
+  "easytithe",
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "ruff==0.16.10",
+  "ty==0.0.84",
+  "types-requests==2.33.0.20260906",
+  "pip-audit==2.10.1",
+]
+
+[tool.setuptools]
+packages = ["breeze"]
+
+[tool.setuptools.package-data]
+breeze = ["py.typed"]
+
+[tool.uv]
+required-version = "==0.12.22"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "PTH", "ASYNC"]
+ignore = ["E501"]
+
+[tool.ty.environment]
+python-version = "3.14"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "samples/easytithe/tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = ["--import-mode=importlib", "--strict-config", "--strict-markers"]
+filterwarnings = ["error"]
+
+[tool.uv.sources]
+easytithe = { path = "samples/easytithe", editable = true }

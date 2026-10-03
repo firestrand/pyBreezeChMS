@@ -8,120 +8,245 @@ Usage:
 
   breeze_api = breeze.BreezeApi(
       breeze_url='https://demo.breezechms.com',
-      api_key='5c2d2cbacg3...')
+      api_key='YOUR_API_KEY')
   people = breeze_api.get_people();
 
   for person in people:
-    print '%s %s' % (person['first_name'], person['last_name'])
+    print(f"{person['first_name']} {person['last_name']}")
 """
 
-__author__ = 'alexortizrosado@gmail.com (Alex Ortiz-Rosado)'
+__author__ = "alexortizrosado@gmail.com (Alex Ortiz-Rosado)"
 
+import json
 import logging
+import math
+from collections.abc import Iterable, Mapping
+from enum import StrEnum
+from typing import Protocol
+from urllib.parse import quote, urlsplit
+
 import requests
 
-from .utils import make_enum
+logger = logging.getLogger(__name__)
 
-ENDPOINTS = make_enum(
-    'BreezeApiURL',
-    PEOPLE='/api/people',
-    EVENTS='/api/events',
-    PROFILE_FIELDS='/api/profile',
-    CONTRIBUTIONS='/api/giving',
-    FUNDS='/api/funds',
-    PLEDGES='/api/pledges',
-    TAGS='/api/tags',
-    ACCOUNT_SUMMARY='/api/account/summary',
-    FORMS='/api/forms')
+type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+type Identifier = str | int
+type Amount = str | int | float
+
+
+class ENDPOINTS(StrEnum):
+    """Breeze endpoint paths, usable as strings."""
+
+    PEOPLE = "/api/people"
+    EVENTS = "/api/events"
+    PROFILE_FIELDS = "/api/profile"
+    CONTRIBUTIONS = "/api/giving"
+    FUNDS = "/api/funds"
+    PLEDGES = "/api/pledges"
+    TAGS = "/api/tags"
+    ACCOUNT_SUMMARY = "/api/account/summary"
+    FORMS = "/api/forms"
+
+
+class HttpResponse(Protocol):
+    """Response operations required by the client."""
+
+    @property
+    def status_code(self) -> int: ...
+    def iter_content(self, chunk_size: int) -> Iterable[bytes]: ...
+    def close(self) -> None: ...
+
+
+class HttpConnection(Protocol):
+    """Injectable transport; the caller owns its lifecycle."""
+
+    def get(
+        self,
+        url: str,
+        *,
+        verify: bool,
+        params: Mapping[str, str],
+        headers: Mapping[str, str],
+        timeout: float,
+        stream: bool,
+        allow_redirects: bool,
+    ) -> HttpResponse: ...
+
+
+def _json_value(value: object) -> JsonValue:
+    """Validate the decoded JSON boundary before exposing typed data."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    raise BreezeError("Invalid JSON value in API response.")
 
 
 class BreezeError(Exception):
     """Exception for BreezeApi."""
+
     pass
 
 
-class BreezeApi(object):
+def _validate_json_array(value: str) -> None:
+    """Reject malformed field/fund payloads before issuing a write."""
+    try:
+        decoded: object = json.loads(value)
+        validated = _json_value(decoded)
+    except (ValueError, RecursionError) as error:
+        raise BreezeError("Invalid JSON request parameter.") from error
+    if not isinstance(validated, list) or any(not isinstance(item, dict) for item in validated):
+        raise BreezeError("JSON request parameter must be an array of objects.")
+
+
+class BreezeApi:
     """A wrapper for the Breeze REST API."""
 
-    def __init__(self, breeze_url, api_key,
-                 dry_run=False,
-                 connection=requests.Session()):
-        """Instantiates the BreezeApi with your Breeze account information.
+    def __init__(
+        self,
+        breeze_url: str,
+        api_key: str,
+        dry_run: bool = False,
+        connection: HttpConnection | None = None,
+        *,
+        max_response_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        """Create a client for an HTTPS Breeze subdomain.
 
-        Args:
-          breeze_url: Fully qualified domain for your organizations Breeze
-                      service.
-          api_key: Unique Breeze API key. For instructions on finding your
-                   organizations API key, see:
-                   http://breezechms.com/docs#extensions_api
-          dry_run: Enable no-op mode, which disables requests from being made.
-                   When combined with debug, this allows debugging requests
-                   without affecting data in your Breeze account."""
-
-        self.breeze_url = breeze_url
+        A default session is owned by this client; close it or use a context
+        manager. Injected transports remain owned by the caller. Responses are
+        limited to max_response_bytes; paginate large result sets.
+        """
+        try:
+            parsed = urlsplit(breeze_url)
+            port = parsed.port
+        except ValueError as error:
+            raise BreezeError("Invalid Breeze URL.") from error
+        host = parsed.hostname or ""
+        subdomain = host.removesuffix(".breezechms.com")
+        if (
+            parsed.scheme != "https"
+            or not host.endswith(".breezechms.com")
+            or not subdomain
+            or "." in subdomain
+            or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in subdomain)
+            or subdomain.startswith("-")
+            or subdomain.endswith("-")
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise BreezeError("Provide an HTTPS URL for a Breeze subdomain.")
+        if (
+            not isinstance(api_key, str)
+            or not api_key.strip()
+            or "\r" in api_key
+            or "\n" in api_key
+        ):
+            raise BreezeError("Provide a nonempty API key without newlines.")
+        if max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be positive.")
+        self.breeze_url = f"https://{host}"
         self.api_key = api_key
         self.dry_run = dry_run
-        self.connection = connection
+        self.max_response_bytes = max_response_bytes
+        self._owns_connection = connection is None
+        self.connection: HttpConnection = requests.Session() if connection is None else connection
 
-        # TODO(alex): use urlparse to check url format.
-        if not (self.breeze_url and self.breeze_url.startswith('https://') and
-                self.breeze_url.find('.breezechms.')):
-            raise BreezeError('You must provide your breeze_url as ',
-                              'subdomain.breezechms.com')
-
-        if not self.api_key:
-            raise BreezeError('You must provide an API key.')
-
-    def _request(self, endpoint, params=None, headers=None, timeout=60):
-        """Makes an HTTP request to a given url.
-
-        Args:
-          endpoint: URL where the service can be accessed.
-          params: Query parameters to append to endpoint url.
-          headers: HTTP headers; used for authenication parameters.
-          timeout: Timeout in seconds for HTTP request.
-
-        Returns:
-          HTTP response
-
-        Throws:
-          BreezeError if connection or request fails."""
-        if headers is None:
-            headers = {}
-        headers.update({
-          'Content-Type': 'application/json',
-          'Api-Key': self.api_key}
-          )
-
-        if params is None:
-            params = {}
-        keywords = dict(params=params, headers=headers, timeout=timeout)
-        url = '%s%s' % (self.breeze_url, endpoint)
-
-        logging.debug('Making request to %s', url)
+    def _request(
+        self,
+        endpoint: str,
+        params: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = 60,
+    ) -> JsonValue:
+        """Make one bounded request without retrying writes or following redirects."""
+        request_headers = dict(headers or {})
+        request_headers.update({"Content-Type": "application/json", "Api-Key": self.api_key})
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive.")
+        if len(endpoint.encode("utf-8")) > 64 * 1024:
+            raise BreezeError("Breeze request exceeds the 64 KiB URL limit.")
         if self.dry_run:
-            return
-
-        response = self.connection.get(url, verify=True, **keywords)
+            return None
+        # Query values may contain names, financial data, or contact information.
+        logger.debug("Making Breeze request")
         try:
-            response = response.json()
-        except requests.ConnectionError as error:
-            raise BreezeError(error)
-        else:
-            if not self._request_succeeded(response):
-                raise BreezeError(response)
-            logging.debug('JSON Response: %s', response)
-            return response
+            response = self.connection.get(
+                f"{self.breeze_url}{endpoint}",
+                verify=True,
+                params=params or {},
+                headers=request_headers,
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            )
+        except requests.RequestException as error:
+            raise BreezeError("Breeze connection failed.") from error
+        try:
+            if not 200 <= response.status_code < 300:
+                raise BreezeError(f"Breeze returned HTTP {response.status_code}.")
+            content = bytearray()
+            try:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if len(content) + len(chunk) > self.max_response_bytes:
+                        raise BreezeError("Breeze response exceeds the configured size limit.")
+                    content.extend(chunk)
+            except requests.RequestException as error:
+                raise BreezeError("Failed to read Breeze response.") from error
+            try:
+                decoded: object = json.loads(content)
+            except (ValueError, UnicodeDecodeError, RecursionError) as error:
+                raise BreezeError("Breeze returned invalid JSON.") from error
+            try:
+                result = _json_value(decoded)
+            except RecursionError as error:
+                raise BreezeError("Breeze response JSON is too deeply nested.") from error
+            if not self._request_succeeded(result):
+                raise BreezeError("Breeze reported an API error.")
+            return result
+        finally:
+            response.close()
 
-    def _request_succeeded(self, response):
-        """Predicate to ensure that the HTTP request succeeded."""
+    def _request_succeeded(self, response: JsonValue) -> bool:
+        """Accept containers and true, rejecting error objects and other scalars."""
         if isinstance(response, bool):
             return response
-        else:
-            return not (('errors' in response) or ('errorCode' in response))
+        if isinstance(response, dict):
+            return not ("errors" in response or "errorCode" in response)
+        return isinstance(response, list)
 
-    def get_account_summary(self):
-        """Retrieve the details for a specific account using the API key 
+    def close(self) -> None:
+        """Close the owned session; injected transports remain caller-owned."""
+        if self._owns_connection and isinstance(self.connection, requests.Session):
+            self.connection.close()
+
+    def __enter__(self) -> BreezeApi:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+    def _payment_id(self, response: JsonValue) -> Identifier | None:
+        """Validate payment responses while preserving dry-run absence."""
+        if response is None and self.dry_run:
+            return None
+        if not isinstance(response, dict):
+            raise BreezeError("Invalid payment response.")
+        payment_id = response.get("payment_id")
+        if isinstance(payment_id, bool) or not isinstance(payment_id, (str, int)):
+            raise BreezeError("Missing or invalid payment ID.")
+        return payment_id
+
+    def get_account_summary(self) -> JsonValue:
+        """Retrieve the details for a specific account using the API key
           and URL. It can also work to see if the key and URL are valid.
 
         Returns:
@@ -133,7 +258,7 @@ class BreezeApi(object):
             "status":"1",
             "created_on":"2018-09-10 09:19:35",
             "details":{
-                "timezone":"America\/New_York",
+                "timezone":"America/New_York",
                 "country":{
                     "id":"2",
                     "name":"United States of America",
@@ -146,10 +271,12 @@ class BreezeApi(object):
                 }
             }
           }
-          """
+        """
         return self._request(ENDPOINTS.ACCOUNT_SUMMARY)
 
-    def get_people(self, limit=None, offset=None, details=False):
+    def get_people(
+        self, limit: int | None = None, offset: int | None = None, details: bool = False
+    ) -> JsonValue:
         """List people from your database.
 
         Args:
@@ -164,35 +291,37 @@ class BreezeApi(object):
             "id":"157857",
             "first_name":"Thomas",
             "last_name":"Anderson",
-            "path":"img\/profiles\/generic\/blue.jpg"
+            "path":"img/profiles/generic/blue.jpg"
           },
           {
             "id":"157859",
             "first_name":"Kate",
             "last_name":"Austen",
-            "path":"img\/profiles\/upload\/2498d7f78s.jpg"
+            "path":"img/profiles/upload/2498d7f78s.jpg"
           },
           {
             ...
           }"""
 
+        if (limit is not None and limit < 0) or (offset is not None and offset < 0):
+            raise ValueError("limit and offset must be nonnegative.")
         params = []
-        if limit:
-            params.append('limit=%s' % limit)
-        if offset:
-            params.append('offset=%s' % offset)
+        if limit is not None:
+            params.append("limit={}".format(quote(str(limit), safe="")))
+        if offset is not None:
+            params.append("offset={}".format(quote(str(offset), safe="")))
         if details:
-            params.append('details=1')
-        return self._request('%s/?%s' % (ENDPOINTS.PEOPLE, '&'.join(params)))
+            params.append("details=1")
+        return self._request("{}/?{}".format(ENDPOINTS.PEOPLE, "&".join(params)))
 
-    def get_profile_fields(self):
+    def get_profile_fields(self) -> JsonValue:
         """List profile fields from your database.
 
         Returns:
           JSON response."""
         return self._request(ENDPOINTS.PROFILE_FIELDS)
 
-    def get_person_details(self, person_id):
+    def get_person_details(self, person_id: Identifier) -> JsonValue:
         """Retrieve the details for a specific person by their ID.
 
         Args:
@@ -200,9 +329,13 @@ class BreezeApi(object):
 
         Returns:
           JSON response."""
-        return self._request('%s/%s' % (ENDPOINTS.PEOPLE, str(person_id)))
+        if str(person_id) in {".", ".."}:
+            raise BreezeError("Invalid person ID.")
+        return self._request(f"{ENDPOINTS.PEOPLE}/{quote(str(person_id), safe='')}")
 
-    def add_person(self, first_name, last_name, fields_json=None):
+    def add_person(
+        self, first_name: str, last_name: str, fields_json: str | None = None
+    ) -> JsonValue:
         """Adds a new person into the database.
 
         Args:
@@ -227,14 +360,15 @@ class BreezeApi(object):
           JSON response equivalent to get_person_details()."""
 
         params = []
-        params.append('first=%s' % first_name)
-        params.append('last=%s' % last_name)
+        params.append("first={}".format(quote(str(first_name), safe="")))
+        params.append("last={}".format(quote(str(last_name), safe="")))
         if fields_json:
-            params.append('fields_json=%s' % fields_json)
+            _validate_json_array(fields_json)
+            params.append("fields_json={}".format(quote(str(fields_json), safe="")))
 
-        return self._request('%s/add?%s' % (ENDPOINTS.PEOPLE, '&'.join(params)))
+        return self._request("{}/add?{}".format(ENDPOINTS.PEOPLE, "&".join(params)))
 
-    def update_person(self, person_id, fields_json):
+    def update_person(self, person_id: Identifier, fields_json: str) -> JsonValue:
         """Updates the details for a specific person in the database.
 
         Args:
@@ -258,12 +392,14 @@ class BreezeApi(object):
         Returns:
           JSON response equivalent to get_person_details(person_id)."""
 
+        _validate_json_array(fields_json)
         return self._request(
-            '%s/update?person_id=%s&fields_json=%s' % (
-                ENDPOINTS.PEOPLE, person_id, fields_json
-            ))
+            "{}/update?person_id={}&fields_json={}".format(
+                ENDPOINTS.PEOPLE, quote(str(person_id), safe=""), quote(str(fields_json), safe="")
+            )
+        )
 
-    def get_events(self, start_date=None, end_date=None):
+    def get_events(self, start_date: str | None = None, end_date: str | None = None) -> JsonValue:
         """Retrieve all events for a given date range.
 
         Args:
@@ -273,13 +409,22 @@ class BreezeApi(object):
         Returns:
           JSON response."""
         params = []
-        if start_date:
-            params.append('start=%s' % start_date)
-        if end_date:
-            params.append('end=%s' % end_date)
-        return self._request('%s/?%s' % (ENDPOINTS.EVENTS, '&'.join(params)))
+        if start_date is not None:
+            params.append("start={}".format(quote(str(start_date), safe="")))
+        if end_date is not None:
+            params.append("end={}".format(quote(str(end_date), safe="")))
+        return self._request("{}/?{}".format(ENDPOINTS.EVENTS, "&".join(params)))
 
-    def add_event(self, name, start_date, end_date=None, all_day=None, description=None, category_id=None, event_id=None):
+    def add_event(
+        self,
+        name: str,
+        start_date: str | int,
+        end_date: str | int | None = None,
+        all_day: bool | None = None,
+        description: str | None = None,
+        category_id: Identifier | None = None,
+        event_id: Identifier | None = None,
+    ) -> JsonValue:
         """Add event for a given date range.
 
         Args:
@@ -293,25 +438,25 @@ class BreezeApi(object):
 
         Returns:
           JSON response."""
-          
+
         params = []
         if name:
-            params.append('name=%s' % name)
-        if start_date:
-            params.append('starts_on=%s' % start_date)
-        if end_date:
-            params.append('ends_on=%s' % end_date)
-        if all_day:
-            params.append('all_day=%s' % all_day)
+            params.append("name={}".format(quote(str(name), safe="")))
+        if start_date is not None:
+            params.append("starts_on={}".format(quote(str(start_date), safe="")))
+        if end_date is not None:
+            params.append("ends_on={}".format(quote(str(end_date), safe="")))
+        if all_day is not None:
+            params.append(f"all_day={int(all_day)}")
         if description:
-            params.append('description=%s' % description)
+            params.append("description={}".format(quote(str(description), safe="")))
         if category_id:
-            params.append('category_id=%s' % category_id)
+            params.append("category_id={}".format(quote(str(category_id), safe="")))
         if event_id:
-            params.append('event_id=%s' % event_id)
-        return self._request('%s/add?%s' % (ENDPOINTS.EVENTS, '&'.join(params)))
+            params.append("event_id={}".format(quote(str(event_id), safe="")))
+        return self._request("{}/add?{}".format(ENDPOINTS.EVENTS, "&".join(params)))
 
-    def event_check_in(self, person_id, event_instance_id):
+    def event_check_in(self, person_id: Identifier, event_instance_id: Identifier) -> JsonValue:
         """Checks in a person into an event.
 
         Args:
@@ -319,11 +464,14 @@ class BreezeApi(object):
           event_instance_id: id for event instance to check into.."""
 
         return self._request(
-            '%s/attendance/add?person_id=%s&instance_id=%s' % (
-                ENDPOINTS.EVENTS, str(person_id), str(event_instance_id)
-            ))
+            "{}/attendance/add?person_id={}&instance_id={}".format(
+                ENDPOINTS.EVENTS,
+                quote(str(person_id), safe=""),
+                quote(str(event_instance_id), safe=""),
+            )
+        )
 
-    def event_check_out(self, person_id, event_instance_id):
+    def event_check_out(self, person_id: Identifier, event_instance_id: Identifier) -> JsonValue:
         """Remove the attendance for a person checked into an event.
 
         Args:
@@ -331,25 +479,30 @@ class BreezeApi(object):
           event_instance_id: id for event instance to check out (delete).
 
         Returns:
-          True if check-out succeeds; False if check-out fails."""
+          Successful JSON response; BreezeError if check-out fails."""
 
         return self._request(
-            '%s/attendance/delete?person_id=%s&instance_id=%s' % (
-                ENDPOINTS.EVENTS, str(person_id), str(event_instance_id)
-            ))
+            "{}/attendance/delete?person_id={}&instance_id={}".format(
+                ENDPOINTS.EVENTS,
+                quote(str(person_id), safe=""),
+                quote(str(event_instance_id), safe=""),
+            )
+        )
 
-    def add_contribution(self,
-                         date=None,
-                         name=None,
-                         person_id=None,
-                         uid=None,
-                         processor=None,
-                         method=None,
-                         funds_json=None,
-                         amount=None,
-                         group=None,
-                         batch_number=None,
-                         batch_name=None):
+    def add_contribution(
+        self,
+        date: str | None = None,
+        name: str | None = None,
+        person_id: Identifier | None = None,
+        uid: Identifier | None = None,
+        processor: str | None = None,
+        method: str | None = None,
+        funds_json: str | None = None,
+        amount: Amount | None = None,
+        group: str | None = None,
+        batch_number: Identifier | None = None,
+        batch_name: str | None = None,
+    ) -> Identifier | None:
         """Add a contribution to Breeze.
 
         Args:
@@ -409,44 +562,46 @@ class BreezeApi(object):
 
         params = []
         if date:
-            params.append('date=%s' % date)
+            params.append("date={}".format(quote(str(date), safe="")))
         if name:
-            params.append('name=%s' % name)
+            params.append("name={}".format(quote(str(name), safe="")))
         if person_id:
-            params.append('person_id=%s' % person_id)
+            params.append("person_id={}".format(quote(str(person_id), safe="")))
         if uid:
-            params.append('uid=%s' % uid)
+            params.append("uid={}".format(quote(str(uid), safe="")))
         if processor:
-            params.append('processor=%s' % processor)
+            params.append("processor={}".format(quote(str(processor), safe="")))
         if method:
-            params.append('method=%s' % method)
+            params.append("method={}".format(quote(str(method), safe="")))
         if funds_json:
-            params.append('funds_json=%s' % funds_json)
-        if amount:
-            params.append('amount=%s' % amount)
+            _validate_json_array(funds_json)
+            params.append("funds_json={}".format(quote(str(funds_json), safe="")))
+        if amount is not None:
+            params.append("amount={}".format(quote(str(amount), safe="")))
         if group:
-            params.append('group=%s' % group)
+            params.append("group={}".format(quote(str(group), safe="")))
         if batch_number:
-            params.append('batch_number=%s' % batch_number)
+            params.append("batch_number={}".format(quote(str(batch_number), safe="")))
         if batch_name:
-            params.append('batch_name=%s' % batch_name)
-        response = self._request('%s/add?%s' % (ENDPOINTS.CONTRIBUTIONS,
-                                                '&'.join(params)))
-        return response['payment_id']
+            params.append("batch_name={}".format(quote(str(batch_name), safe="")))
+        response = self._request("{}/add?{}".format(ENDPOINTS.CONTRIBUTIONS, "&".join(params)))
+        return self._payment_id(response)
 
-    def edit_contribution(self,
-                          payment_id=None,
-                          date=None,
-                          name=None,
-                          person_id=None,
-                          uid=None,
-                          processor=None,
-                          method=None,
-                          funds_json=None,
-                          amount=None,
-                          group=None,
-                          batch_number=None,
-                          batch_name=None):
+    def edit_contribution(
+        self,
+        payment_id: Identifier | None = None,
+        date: str | None = None,
+        name: str | None = None,
+        person_id: Identifier | None = None,
+        uid: Identifier | None = None,
+        processor: str | None = None,
+        method: str | None = None,
+        funds_json: str | None = None,
+        amount: Amount | None = None,
+        group: str | None = None,
+        batch_number: Identifier | None = None,
+        batch_name: str | None = None,
+    ) -> Identifier | None:
         """Edit an existing contribution.
 
         Args:
@@ -507,34 +662,34 @@ class BreezeApi(object):
 
         params = []
         if payment_id:
-            params.append('payment_id=%s' % payment_id)
+            params.append("payment_id={}".format(quote(str(payment_id), safe="")))
         if date:
-            params.append('date=%s' % date)
+            params.append("date={}".format(quote(str(date), safe="")))
         if name:
-            params.append('name=%s' % name)
+            params.append("name={}".format(quote(str(name), safe="")))
         if person_id:
-            params.append('person_id=%s' % person_id)
+            params.append("person_id={}".format(quote(str(person_id), safe="")))
         if uid:
-            params.append('uid=%s' % uid)
+            params.append("uid={}".format(quote(str(uid), safe="")))
         if processor:
-            params.append('processor=%s' % processor)
+            params.append("processor={}".format(quote(str(processor), safe="")))
         if method:
-            params.append('method=%s' % method)
+            params.append("method={}".format(quote(str(method), safe="")))
         if funds_json:
-            params.append('funds_json=%s' % funds_json)
-        if amount:
-            params.append('amount=%s' % amount)
+            _validate_json_array(funds_json)
+            params.append("funds_json={}".format(quote(str(funds_json), safe="")))
+        if amount is not None:
+            params.append("amount={}".format(quote(str(amount), safe="")))
         if group:
-            params.append('group=%s' % group)
+            params.append("group={}".format(quote(str(group), safe="")))
         if batch_number:
-            params.append('batch_number=%s' % batch_number)
+            params.append("batch_number={}".format(quote(str(batch_number), safe="")))
         if batch_name:
-            params.append('batch_name=%s' % batch_name)
-        response = self._request('%s/edit?%s' % (ENDPOINTS.CONTRIBUTIONS,
-                                                 '&'.join(params)))
-        return response['payment_id']
+            params.append("batch_name={}".format(quote(str(batch_name), safe="")))
+        response = self._request("{}/edit?{}".format(ENDPOINTS.CONTRIBUTIONS, "&".join(params)))
+        return self._payment_id(response)
 
-    def delete_contribution(self, payment_id):
+    def delete_contribution(self, payment_id: Identifier) -> Identifier | None:
         """Delete an existing contribution.
 
         Args:
@@ -546,58 +701,62 @@ class BreezeApi(object):
         Throws:
           BreezeError on failure to delete contribution."""
 
-        response = self._request('%s/delete?payment_id=%s' % (
-            ENDPOINTS.CONTRIBUTIONS, payment_id
-        ))
-        return response['payment_id']
+        response = self._request(
+            "{}/delete?payment_id={}".format(
+                ENDPOINTS.CONTRIBUTIONS, quote(str(payment_id), safe="")
+            )
+        )
+        return self._payment_id(response)
 
-    def list_form_entries(self, form_id, details=False):
+    def list_form_entries(self, form_id: Identifier, details: bool = False) -> JsonValue:
         """return entries for the given form
 
         Args:
-          form_id:the ID of the form 
+          form_id:the ID of the form
           details: Option to return all information (slower) or just names.
 
         returns:
           JSON response. For example:
           [
-		{
-			"id":"11",
-			"form_id":"15326",
-			"created_on":"2021-03-09 13:04:02",
-			"person_id":null,
-			"response":{
-			    "45":{
-				"id":"13",
-				"oid":"1512",
-				"first_name":"Zoe",
-				"last_name":"Washburne",
-				"created_on":"2021-03-09 13:04:03"
-			    },
-			    "46":"zwashburne@test.com",
-			    "47":"Red"
-			}
-		    },
+        {
+            "id":"11",
+            "form_id":"15326",
+            "created_on":"2021-03-09 13:04:02",
+            "person_id":null,
+            "response":{
+                "45":{
+                "id":"13",
+                "oid":"1512",
+                "first_name":"Zoe",
+                "last_name":"Washburne",
+                "created_on":"2021-03-09 13:04:03"
+                },
+                "46":"zwashburne@test.com",
+                "47":"Red"
+            }
+            },
           ]"""
 
         params = []
-        params.append('form_id=%s' % form_id)
+        params.append("form_id={}".format(quote(str(form_id), safe="")))
         if details:
-            params.append('details=1')
-        return self._request('%s/list_form_entries?%s' % (ENDPOINTS.FORMS, '&'.join(params)))
+            params.append("details=1")
+        return self._request("{}/list_form_entries?{}".format(ENDPOINTS.FORMS, "&".join(params)))
 
-    def list_contributions(self,
-                           start_date=None,
-                           end_date=None,
-                           person_id=None,
-                           include_family=False,
-                           amount_min=None,
-                           amount_max=None,
-                           method_ids=None,
-                           fund_ids=None,
-                           envelope_number=None,
-                           batches=None,
-                           forms=None):
+    def list_contributions(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        person_id: Identifier | None = None,
+        include_family: bool = False,
+        amount_min: Amount | None = None,
+        amount_max: Amount | None = None,
+        method_ids: Iterable[str] | None = None,
+        fund_ids: Iterable[str] | None = None,
+        envelope_number: Identifier | None = None,
+        batches: Iterable[str] | None = None,
+        forms: Iterable[str] | None = None,
+    ) -> JsonValue:
         """Retrieve a list of contributions.
 
         Args:
@@ -623,34 +782,33 @@ class BreezeApi(object):
           BreezeError on malformed request."""
 
         params = []
-        if start_date:
-            params.append('start=%s' % start_date)
-        if end_date:
-            params.append('end=%s' % end_date)
+        if start_date is not None:
+            params.append("start={}".format(quote(str(start_date), safe="")))
+        if end_date is not None:
+            params.append("end={}".format(quote(str(end_date), safe="")))
         if person_id:
-            params.append('person_id=%s' % person_id)
+            params.append("person_id={}".format(quote(str(person_id), safe="")))
         if include_family:
             if not person_id:
-                raise BreezeError('include_family requires a person_id.')
-            params.append('include_family=1')
-        if amount_min:
-            params.append('amount_min=%s' % amount_min)
-        if amount_max:
-            params.append('amount_max=%s' % amount_max)
+                raise BreezeError("include_family requires a person_id.")
+            params.append("include_family=1")
+        if amount_min is not None:
+            params.append("amount_min={}".format(quote(str(amount_min), safe="")))
+        if amount_max is not None:
+            params.append("amount_max={}".format(quote(str(amount_max), safe="")))
         if method_ids:
-            params.append('method_ids=%s' % '-'.join(method_ids))
+            params.append("method_ids={}".format(quote(str("-".join(method_ids)), safe="")))
         if fund_ids:
-            params.append('fund_ids=%s' % '-'.join(fund_ids))
+            params.append("fund_ids={}".format(quote(str("-".join(fund_ids)), safe="")))
         if envelope_number:
-            params.append('envelope_number=%s' % envelope_number)
+            params.append("envelope_number={}".format(quote(str(envelope_number), safe="")))
         if batches:
-            params.append('batches=%s' % '-'.join(batches))
+            params.append("batches={}".format(quote(str("-".join(batches)), safe="")))
         if forms:
-            params.append('forms=%s' % '-'.join(forms))
-        return self._request('%s/list?%s' % (ENDPOINTS.CONTRIBUTIONS,
-                                             '&'.join(params)))
+            params.append("forms={}".format(quote(str("-".join(forms)), safe="")))
+        return self._request("{}/list?{}".format(ENDPOINTS.CONTRIBUTIONS, "&".join(params)))
 
-    def list_funds(self, include_totals=False):
+    def list_funds(self, include_totals: bool = False) -> JsonValue:
         """List all funds.
 
         Args:
@@ -661,18 +819,17 @@ class BreezeApi(object):
 
         params = []
         if include_totals:
-            params.append('include_totals=1')
-        return self._request('%s/list?%s' %
-                             (ENDPOINTS.FUNDS, '&'.join(params)))
+            params.append("include_totals=1")
+        return self._request("{}/list?{}".format(ENDPOINTS.FUNDS, "&".join(params)))
 
-    def list_campaigns(self):
+    def list_campaigns(self) -> JsonValue:
         """List of campaigns.
 
         Returns:
           JSON response."""
-        return self._request('%s/list_campaigns' % (ENDPOINTS.PLEDGES))
+        return self._request(f"{ENDPOINTS.PLEDGES}/list_campaigns")
 
-    def list_pledges(self, campaign_id):
+    def list_pledges(self, campaign_id: Identifier) -> JsonValue:
         """List of pledges within a campaign.
 
         Args:
@@ -680,11 +837,13 @@ class BreezeApi(object):
 
         Returns:
           JSON response."""
-        return self._request('%s/list_pledges?campaign_id=%s' % (
-            ENDPOINTS.PLEDGES, campaign_id
-        ))
+        return self._request(
+            "{}/list_pledges?campaign_id={}".format(
+                ENDPOINTS.PLEDGES, quote(str(campaign_id), safe="")
+            )
+        )
 
-    def get_tags(self, folder=None):
+    def get_tags(self, folder: Identifier | None = None) -> JsonValue:
         """List of tags
 
         Args:
@@ -708,13 +867,12 @@ class BreezeApi(object):
             { ... }
             ]"""
 
-
         params = []
         if folder:
-            params.append('folder_id=%s' % folder)
-        return self._request('%s/%s/?%s' % (ENDPOINTS.TAGS, 'list_tags', '&'.join(params)))
+            params.append("folder_id={}".format(quote(str(folder), safe="")))
+        return self._request("{}/{}/?{}".format(ENDPOINTS.TAGS, "list_tags", "&".join(params)))
 
-    def get_tag_folders(api):
+    def get_tag_folders(self) -> JsonValue:
         """List of tag folders
 
         Args: (none)
@@ -747,56 +905,48 @@ class BreezeApi(object):
                  "created_on":"2018-12-15 18:11:31"
              }
              ]"""
-        return api._request("%s/%s" % (ENDPOINTS.TAGS, "list_folders"))
+        return self._request("{}/{}".format(ENDPOINTS.TAGS, "list_folders"))
 
-    def assign_tag(self, 
-                   person_id,
-                   tag_id):
+    def assign_tag(self, person_id: Identifier, tag_id: Identifier) -> JsonValue:
         """
         Update a person's tag/s.
-        
+
         params:
-        
+
         person_id: an existing person's user id
-        
+
         tag_id: the id number of the tag you want to assign to the user
-        
-        output: true or false upon success or failure of tag update
+
+        Returns successful JSON, or raises BreezeError on failure.
         """
         params = []
-                   
-        params.append('person_id=%s' % person_id)           
 
-        params.append('tag_id=%s' % tag_id)
+        params.append("person_id={}".format(quote(str(person_id), safe="")))
 
-        response = self._request('%s/assign?%s' %
-                             (ENDPOINTS.TAGS, '&'.join(params)))
-        
+        params.append("tag_id={}".format(quote(str(tag_id), safe="")))
+
+        response = self._request("{}/assign?{}".format(ENDPOINTS.TAGS, "&".join(params)))
+
         return response
-    
-    def unassign_tag(self, 
-                   person_id,
-                   tag_id):
+
+    def unassign_tag(self, person_id: Identifier, tag_id: Identifier) -> JsonValue:
         """
         Delete a person's tag/s.
-        
+
         params:
-        
+
         person_id: an existing person's user id
-        
+
         tag_id: the id number of the tag you want to assign to the user
-        
-        output: true or false upon success or failure of tag deletion
+
+        Returns successful JSON, or raises BreezeError on failure.
         """
         params = []
-                   
-        params.append('person_id=%s' % person_id)           
 
-        params.append('tag_id=%s' % tag_id)
+        params.append("person_id={}".format(quote(str(person_id), safe="")))
 
-        response = self._request('%s/unassign?%s' %
-                             (ENDPOINTS.TAGS, '&'.join(params)))
-        
-        return response            
+        params.append("tag_id={}".format(quote(str(tag_id), safe="")))
 
+        response = self._request("{}/unassign?{}".format(ENDPOINTS.TAGS, "&".join(params)))
 
+        return response

@@ -1,38 +1,91 @@
 PyBreezeChMS
 =================
 
-Python interface to BreezeChMS REST API http://www.breezechms.com
+Python interface to BreezeChMS REST API https://www.breezechms.com
 
-[![Build Status](https://travis-ci.org/alexortizrosado/pyBreezeChMS.svg?branch=master)](https://travis-ci.org/alexortizrosado/pyBreezeChMS) [![Coverage Status](https://coveralls.io/repos/alexortizrosado/pyBreezeChMS/badge.png)](https://coveralls.io/r/aortiz32/pyBreezeChMS)
+[![CI](https://github.com/firestrand/pyBreezeChMS/actions/workflows/ci.yml/badge.svg)](https://github.com/firestrand/pyBreezeChMS/actions/workflows/ci.yml)
 
 ## Installation
 
-Before using pyBreezeChMS, you'll need to install the [requests](http://docs.python-requests.org/en/latest/) library:
+Requires Python 3.14; development and CI use Python 3.14.8 and uv 0.12.22.
+Install this fork with its declared Requests dependency:
 
-    $ sudo pip install requests
+```sh
+uv pip install 'git+https://github.com/firestrand/pyBreezeChMS.git@main'
+```
 
 ## Getting Started
 
+Set `BREEZE_API_KEY` in your environment, then use a context manager:
+
 ```python
+import os
 from breeze import breeze
 
-breeze_api = breeze.BreezeApi(
-    breeze_url='https://your_subdomain.breezechms.com',
-    api_key='YourApiKey')
+with breeze.BreezeApi(
+    breeze_url="https://your_subdomain.breezechms.com",
+    api_key=os.environ["BREEZE_API_KEY"],
+) as client:
+    people = client.get_people()
 ```
 
-To get a JSON of all people:
+The client owns its default session. Injected connections stay caller-owned
+and must implement the `HttpConnection` protocol, including streaming responses.
+Requests use verified TLS, a 60-second inactivity timeout, no redirects or
+retries, and a 16 MiB response limit (`max_response_bytes` is configurable).
+Paginate large result sets. `dry_run=True` returns `None` without making Breeze
+requests, including contribution operations. HTTP failures, malformed responses,
+and API errors raise `BreezeError` with sanitized messages and chained causes.
+Query values are encoded individually. Endpoint constants are now `StrEnum`
+values that continue to work as strings. The legacy `make_enum` utility remains
+available but no longer mutates caller-owned method mappings.
 
-```python
+Version 2.0 drops Python 2 and older Python 3 versions. URLs must be HTTPS Breeze
+subdomains without credentials, paths, or query strings. Supported Requests
+versions are `>=2.34.2,<3`; the lock records all exact development versions.
 
-people = breeze_api.get_people()
+## Development and verification
+
+```sh
+git clone --recurse-submodules https://github.com/firestrand/pyBreezeChMS.git
+cd pyBreezeChMS
+uv sync --locked --group dev
+scripts/check.sh
+scripts/check-artifacts.sh
 ```
 
-## Test
-    pip install python-coveralls
-    python -m unittest tests.breeze_test
-    coverage run --source=breeze setup.py test
-    coverage report
+The shared gate checks formatting, lint, types, offline tests, dependency
+vulnerabilities, and wheel/sdist builds. Artifact checks install both distributions
+in a clean environment outside the checkout. The standards audit and migration
+notes are in [docs/maintenance.rst](docs/maintenance.rst).
+
+## EasyTithe importer
+
+The `samples/easytithe` Git submodule is the Python 3.14 replacement maintained at
+[firestrand/easytithe](https://github.com/firestrand/easytithe). Its original
+login/export HTTP contract is verified with offline fixtures; live service
+availability has not been checked. Logging in configures the account's Custom
+export format when needed, matching the original adapter's behavior.
+
+Set `EASYTITHE_USERNAME`, `EASYTITHE_PASSWORD`, and `BREEZE_API_KEY` in the runtime
+environment, then run:
+
+```sh
+uv run --locked python samples/easytithe_importer.py \
+  --breeze_url https://your_subdomain.breezechms.com \
+  --start_date 10/01/2026 --end_date 10/03/2026 --dry_run
+```
+
+Remove `--dry_run` to import. Dry-run downloads and validates the report but makes
+no Breeze requests. The importer matches exact case-insensitive names, skips
+existing contributions for matching people, rejects ambiguous names, and imports
+unmatched rows anonymously. Secrets and individual records are excluded from
+logs. CLI credentials have been replaced by environment variables. Financial
+records are validated before the first write. Review matches and date ranges
+before importing; anonymous records do not have a stable person ID for duplicate
+checks. Duplicate detection preserves the original same-person/date/amount
+heuristic; distinct gifts with those same values may be skipped. Importing is sequential and does not roll back earlier successful writes
+if a later record fails. No automatic retry is performed.
 
 ## How do I make a contribution?
 Never made an open source contribution before? Wondering how contributions work in the in our project? Here's a quick rundown!
@@ -54,4 +107,4 @@ Never made an open source contribution before? Wondering how contributions work 
 
 ## License
 
-Code released under the [Apache 2.0](https://github.com/aortiz32/pyBreezeChMS/blob/master/LICENSE) license.
+Code released under the [Apache 2.0](https://github.com/firestrand/pyBreezeChMS/blob/main/LICENSE) license.

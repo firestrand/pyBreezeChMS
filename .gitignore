@@ -35,3 +35,8 @@ htmlcov
 .mr.developer.cfg
 .project
 .pydevproject
+
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/

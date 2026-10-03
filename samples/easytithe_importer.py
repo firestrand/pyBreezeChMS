@@ -1,265 +1,195 @@
-#!/usr/bin/python
-"""Import contributions from EasyTithe to BreezeChMS.
+#!/usr/bin/env python3
+"""Import EasyTithe reports into Breeze using runtime environment credentials.
 
-Logs into your EasyTithe account and imports contributions into BreezeChMS using
-the Python Breeze API.
-
-Usage:
-  python easytithe_importer.py \\
-    --username user@email.com \\
-    --password easytithe_password \\
-    --breeze_url https://demo.breezechms.com \\
-    --breeze_api_key 5c2d2cbacg3 \\
-    --start_date 01/01/2014 \\
-    --end_date 12/31/2014 \\
-    [--debug \\]
-    [--dry_run \\]
+Set EASYTITHE_USERNAME, EASYTITHE_PASSWORD and BREEZE_API_KEY. Run with
+--breeze_url, --start_date and --end_date. --dry_run validates the downloaded
+report without making Breeze requests. Logs contain counts rather than personal
+or financial records. EasyTithe configures its Custom export format on login.
 """
-__author__ = 'alex@rohichurch.org (Alex Ortiz-Rosado)'
 
 import argparse
+import json
 import logging
 import os
-import re
-import sys
-
+from collections.abc import Iterable, Mapping
 from datetime import datetime
-from easytithe import easytithe
-try:
-    from breeze import breeze
-except ImportError:
-    sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                 os.pardir))
-    from breeze import breeze
+from decimal import Decimal, InvalidOperation
+
+from easytithe import EasyTithe
+
+from breeze.breeze import BreezeApi, BreezeError, Identifier, JsonValue
+
+logger = logging.getLogger(__name__)
 
 
-class Contribution(object):
-    """An object for storing a contribution from EasyTithe."""
+class Contribution:
+    """A validated EasyTithe export row; fund edits affect only this instance."""
 
-    def __init__(self, contribution):
-        """Instantiates a Contribution object.
-
-    Args:
-      contribution: a single contribution from EasyTithe.
-    """
-        self._contribution = contribution
-
-    @property
-    def first_name(self):
-        return self._contribution['Name'].split()[0]
-
-    @property
-    def last_name(self):
-        return self._contribution['Name'].split()[-1]
+    def __init__(self, contribution: Mapping[str, str]) -> None:
+        required = {"Name", "Date", "Fund", "Amount", "Type", "Email", "PersonID"}
+        if not required <= contribution.keys() or not contribution["Name"].strip():
+            raise ValueError("Incomplete EasyTithe contribution.")
+        self._contribution = dict(contribution)
+        # Validate before the importer can send a financial record.
+        datetime.strptime(contribution["Date"], "%m/%d/%Y")
+        try:
+            amount = Decimal(self.amount)
+        except InvalidOperation as error:
+            raise ValueError("Invalid contribution amount.") from error
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("Contribution amount must be finite and nonnegative.")
 
     @property
-    def full_name(self):
-        return '%s %s' % (self.first_name, self.last_name)
-        
-    @property
-    def name(self):
-        return self._contribution['Name']
+    def first_name(self) -> str:
+        return self.name.split()[0]
 
     @property
-    def date(self):
-        formatted_date = datetime.strptime(
-            self._contribution['Date'], '%m/%d/%Y')
-        return formatted_date.strftime('%Y-%m-%d')
+    def last_name(self) -> str:
+        return self.name.split()[-1]
 
     @property
-    def fund(self):
-        return self._contribution['Fund']
+    def full_name(self) -> str:
+        return self.name.strip()
+
+    @property
+    def name(self) -> str:
+        return self._contribution["Name"]
+
+    @property
+    def date(self) -> str:
+        return datetime.strptime(self._contribution["Date"], "%m/%d/%Y").strftime("%Y-%m-%d")
+
+    @property
+    def fund(self) -> str:
+        return self._contribution["Fund"]
 
     @fund.setter
-    def fund(self, fund_name):
-        self._contribution['Fund'] = fund_name
+    def fund(self, fund_name: str) -> None:
+        self._contribution["Fund"] = fund_name
 
     @property
-    def amount(self):
-        # Removes leading $ and any thousands seperator.
-        return self._contribution['Amount'].lstrip('$').replace(',', '')
+    def amount(self) -> str:
+        return self._contribution["Amount"].lstrip("$").replace(",", "")
 
     @property
-    def card_type(self):
-        return self._contribution['Type']
+    def card_type(self) -> str:
+        return self._contribution["Type"]
 
     @property
-    def email_address(self):
-        return self._contribution['Email']
+    def email_address(self) -> str:
+        return self._contribution["Email"]
 
     @property
-    def uid(self):
-        return self._contribution['PersonID']
+    def uid(self) -> str:
+        return self._contribution["PersonID"]
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '-u', '--username',
-        required=True,
-        nargs='*',
-        help='EasyTithe username.')
-
-    parser.add_argument(
-        '-p', '--password',
-        required=True,
-        nargs='*',
-        help='EasyTithe password.')
-
-    parser.add_argument(
-        '-k', '--breeze_api_key',
-        required=True,
-        nargs='*',
-        help='Breeze API key.')
-
-    parser.add_argument(
-        '-l', '--breeze_url',
-        required=True,
-        nargs='*',
-        help=('Fully qualified doman name for your organizations Breeze '
-              'subdomain.'))
-
-    parser.add_argument(
-        '-s', '--start_date',
-        required=True,
-        nargs='*',
-        help='Start date to get contribution information for.')
-
-    parser.add_argument(
-        '-e', '--end_date',
-        required=True,
-        nargs='*',
-        help='End date to get contribution information for.')
-
-    parser.add_argument(
-        '-d', '--dry_run',
-        action='store_true',
-        help='No-op, do not write anything.')
-
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Print debug output.')
-
-    args = parser.parse_args()
-    return args
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-l", "--breeze_url", required=True)
+    parser.add_argument("-s", "--start_date", required=True, help="MM/DD/YYYY")
+    parser.add_argument("-e", "--end_date", required=True, help="MM/DD/YYYY")
+    parser.add_argument("-d", "--dry_run", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    return parser.parse_args()
 
 
-def enable_console_logging(default_level=logging.INFO):
-    logger = logging.getLogger()
-    console_logger = logging.StreamHandler()
-    console_logger.setLevel(default_level)
-
-    formatter = logging.Formatter(
-        '%(asctime)s [%(levelname)8s] %(filename)s:%(lineno)s - %(message)s ',
-        '%Y-%m-%d %H:%M:%S')
-    console_logger.setFormatter(formatter)
-
-    logger.addHandler(console_logger)
-    logging.Formatter()
-    logger.setLevel(default_level)
+def enable_console_logging(default_level: int = logging.INFO) -> None:
+    logging.basicConfig(level=default_level, format="%(asctime)s [%(levelname)s] %(message)s")
+    # Transport debug logs include query strings containing personal data.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
 
 
-def main():
-    args = parse_args()
-    if args.debug:
-        enable_console_logging(logging.DEBUG)
-    else:
-        enable_console_logging()
-    start_date = args.start_date[0]
-    end_date = args.end_date[0]
+def _people_index(response: JsonValue) -> dict[str, list[Identifier]]:
+    if not isinstance(response, list):
+        raise BreezeError("Expected a list of Breeze people.")
+    result: dict[str, list[Identifier]] = {}
+    for person in response:
+        if not isinstance(person, dict):
+            raise BreezeError("Invalid Breeze person.")
+        first = person.get("force_first_name", person.get("first_name"))
+        last = person.get("last_name")
+        person_id = person.get("id")
+        if (
+            not isinstance(first, str)
+            or not isinstance(last, str)
+            or isinstance(person_id, bool)
+            or not isinstance(person_id, (str, int))
+        ):
+            raise BreezeError("Missing or invalid Breeze person fields.")
+        name = f"{first.strip()} {last.strip()}".strip().casefold()
+        if name:
+            result.setdefault(name, []).append(person_id)
+    return result
 
-    # Log into EasyTithe and get all contributions for date range.
-    username = args.username[0]
-    password = args.password[0]
-    logging.info('Connecting to EasyTithe as [%s]', username)
-    easytithe_api = easytithe.EasyTithe(username, password)
-    contributions = [
-        Contribution(contribution)
-        for contribution in easytithe_api.GetContributions(
-            start_date, end_date)
-    ]
 
-    if not contributions:
-        logging.info('No contributions found between %s and %s.', start_date,
-                     end_date)
-        sys.exit(0)
+def import_contributions(client: BreezeApi, contributions: Iterable[Contribution]) -> int:
+    """Import validated rows, skipping duplicates and rejecting ambiguous names.
 
-    logging.info('Found %s contributions between %s and %s.',
-                 len(contributions), start_date, end_date)
-
-    # Log into Breeze using API.
-    breeze_api_key = args.breeze_api_key[0]
-    breeze_url = args.breeze_url[0]
-    breeze_api = breeze.BreezeApi(breeze_url, breeze_api_key,
-                                  dry_run=args.dry_run)
-    people = breeze_api.get_people()
-    if not people:
-        logging.info('No people in Breeze database.')
-        sys.exit(0)
-    logging.info('Found %d people in Breeze database.', len(people))
-
-    for person in people:
-        person['full_name'] = '%s %s' % (person['force_first_name'].strip(),
-                                         person['last_name'].strip())
-
+    Unmatched rows remain anonymous, as in the original importer. Matching uses
+    exact case-insensitive names; names are data, never regular expressions.
+    Dry-run validates rows without issuing any Breeze request.
+    """
+    if client.dry_run:
+        count = sum(1 for _ in contributions)
+        logger.info("Validated %d contributions in dry-run mode", count)
+        return 0
+    people = _people_index(client.get_people())
+    imported = 0
     for contribution in contributions:
-        person_match = [person for person in people
-                        if re.search(person['full_name'],
-                                     contribution.full_name, re.IGNORECASE) and 
-                        person['full_name'] != ' ']
-
-        contribution_params = {
-            'date': contribution.date,
-            'name': contribution.name,
-            'uid': contribution.uid,
-            'method': 'Credit/Debit Online',
-            'funds_json': (
-                '[{"name": "%s", "amount": "%s"}]' % (contribution.fund,
-                                                      contribution.amount)),
-            'amount': contribution.amount,
-            'group': contribution.date,
-            'processor': 'EasyTithe',
-            'batch_name': 'EasyTithe (%s)' % contribution.date
-        }
-
-        if not person_match:
-            logging.warning(
-                'Unable to find a matching person in Breeze for [%s]. '
-                'Adding contribution to Breeze as Anonymous.',
-                contribution.full_name)
-            breeze_api.add_contribution(**contribution_params)
-
-        else:
-
-            def is_duplicate_contribution(person_id, date, amount):
-                """Predicate that checks if a contribution is a duplicate."""
-                return breeze_api.list_contributions(
-                    start_date=date,
-                    end_date=date,
-                    person_id=person_id,
-                    amount_min=amount,
-                    amount_max=amount)
-
-            if is_duplicate_contribution(date=contribution.date,
-                                         person_id=person_match[0]['id'],
-                                         amount=contribution.amount):
-                logging.warning(
-                    'Skipping duplicate contribution for [%s] paid on [%s] '
-                    'for [%s]', contribution.full_name, contribution.date,
-                    contribution.amount)
+        matches = people.get(contribution.full_name.casefold(), [])
+        if len(matches) > 1:
+            raise BreezeError("Ambiguous person match; resolve before importing.")
+        person_id = matches[0] if matches else None
+        if person_id is not None:
+            existing = client.list_contributions(
+                start_date=contribution.date,
+                end_date=contribution.date,
+                person_id=person_id,
+                amount_min=contribution.amount,
+                amount_max=contribution.amount,
+            )
+            if not isinstance(existing, list):
+                raise BreezeError("Expected a contribution list when checking duplicates.")
+            if existing:
+                logger.info("Skipped a duplicate contribution")
                 continue
-            logging.info('Person:[%s]', person_match)
+        else:
+            logger.warning("No matching person; importing an anonymous contribution")
+        client.add_contribution(
+            date=contribution.date,
+            name=contribution.name,
+            uid=contribution.uid,
+            method="Credit/Debit Online",
+            funds_json=json.dumps([{"name": contribution.fund, "amount": contribution.amount}]),
+            amount=contribution.amount,
+            group=contribution.date,
+            processor="EasyTithe",
+            batch_name=f"EasyTithe ({contribution.date})",
+            person_id=person_id,
+        )
+        imported += 1
+    logger.info("Imported %d contributions", imported)
+    return imported
 
-            logging.info(
-                'Adding contribution for [%s] to fund [%s] in the amount of '
-                '[%s] paid on [%s].', contribution.full_name,
-                contribution.fund, contribution.amount, contribution.date)
 
-            # Add the contribution on the matching person's Breeze profile.
-            contribution_params['person_id'] = person_match[0]['id']
-            breeze_api.add_contribution(**contribution_params)
+def main() -> None:
+    args = parse_args()
+    enable_console_logging(logging.DEBUG if args.debug else logging.INFO)
+    required = ("EASYTITHE_USERNAME", "EASYTITHE_PASSWORD", "BREEZE_API_KEY")
+    if any(not os.environ.get(name) for name in required):
+        raise ValueError("Set EASYTITHE_USERNAME, EASYTITHE_PASSWORD and BREEZE_API_KEY.")
+    with (
+        EasyTithe(os.environ["EASYTITHE_USERNAME"], os.environ["EASYTITHE_PASSWORD"]) as source,
+        BreezeApi(args.breeze_url, os.environ["BREEZE_API_KEY"], dry_run=args.dry_run) as client,
+    ):
+        # Validate the complete bounded report before writing any contributions.
+        contributions = [
+            Contribution(row) for row in source.GetContributions(args.start_date, args.end_date)
+        ]
+        import_contributions(client, contributions)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

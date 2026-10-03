@@ -1,24 +1,28 @@
+from collections.abc import Callable, Mapping
+
 # Taken from https://raw.githubusercontent.com/ozgur/python-linkedin/master/linkedin/utils.py
 
-def make_enum(enum_type='enum', base_classes=None, methods=None, **attrs):
-  """
-  Generates a enumeration with the given attributes.
-  """
-  # Enumerations can not be initalized as a new instance
-  def __init__(instance, *args, **kwargs):
-    raise RuntimeError('%s types can not be initialized.' % enum_type)
 
-  if base_classes is None:
-    base_classes = ()
+def make_enum(
+    enum_type: str = "enum",
+    base_classes: tuple[type, ...] | None = None,
+    methods: Mapping[str, Callable[..., object]] | None = None,
+    **attrs: object,
+) -> type:
+    """Build a legacy enum class without mutating caller-provided methods.
 
-  if methods is None:
-    methods = {}
+    Retained for external callers; endpoint constants use a typed StrEnum.
+    The dynamic attributes of the returned class require runtime inspection.
+    """
 
-  base_classes = base_classes + (object,)
-  for k, v in methods.items():
-    methods[k] = classmethod(v)
+    def __init__(instance: object, *args: object, **kwargs: object) -> None:
+        raise RuntimeError(f"{enum_type} types cannot be initialized.")
 
-  attrs['enums'] = attrs.copy()
-  methods.update(attrs)
-  methods['__init__'] = __init__
-  return type(enum_type, base_classes, methods)
+    bases = (*base_classes, object) if base_classes is not None else (object,)
+    namespace: dict[str, object] = {
+        name: classmethod(method) for name, method in (methods or {}).items()
+    }
+    namespace.update(attrs)
+    namespace["enums"] = attrs.copy()
+    namespace["__init__"] = __init__
+    return type(enum_type, bases, namespace)
