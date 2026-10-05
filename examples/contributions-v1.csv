@@ -1,0 +1,2 @@
+schema,date,amount,currency,fund,donor_id,donor_name,transaction_id,method
+contributions-v1,2026-10-01,10.00,USD,general,synthetic-donor,Example Donor,,Cash

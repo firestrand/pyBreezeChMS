@@ -40,3 +40,9 @@ htmlcov
 .pytest_cache/
 .ruff_cache/
 __pycache__/
+
+# Local credentials and operator artifacts
+.env
+.env.*
+!.env.example
+.breeze-runs/

@@ -22,7 +22,7 @@ Set BREEZE_API_KEY in your runtime environment.
    from breeze import breeze
 
    with breeze.BreezeApi(
-       breeze_url='https://your_subdomain.breezechms.com',
+       breeze_url='https://your-subdomain.breezechms.com',
        api_key=os.environ['BREEZE_API_KEY'],
    ) as client:
        people = client.get_people()
@@ -30,18 +30,27 @@ Set BREEZE_API_KEY in your runtime environment.
 Clients own default sessions and support close() and context managers. Injected
 transports remain caller-owned and must implement HttpConnection. The client
 verifies TLS, rejects redirects, bounds responses to 16 MiB by default, uses a
-60-second inactivity timeout, and does not retry writes. Use pagination for
+60-second inactivity timeout, a checked elapsed budget, and account pacing.
+It does not retry writes. Blocked synchronous requests cannot be forcibly
+interrupted; see README.md for budget and coordination limits. Use pagination for
 larger reports. Dry-run methods return None without making Breeze requests.
 BreezeError reports HTTP, transport, malformed-response and API failures.
 
 Development
 -----------
 
-Clone with --recurse-submodules and install uv 0.12.22. Run scripts/check.sh and
+Clone the core repository and install uv 0.12.22. Run scripts/check.sh and
 scripts/check-artifacts.sh for locked checks, offline tests, vulnerability
 scanning, builds, and installation smoke tests. See README.md for the Python 3
-EasyTithe submodule and importer migration, and docs/maintenance.rst for the
+legacy EasyTithe migration, and docs/maintenance.rst for the
 standards audit.
+Provider-independent CSV/JSON Lines exchange, optional dotenv support, installed
+preview/plan/apply commands and durable recovery are in docs/data-exchange.rst.
+Populate private .env using .env.example for Breeze URL/key configuration.
+The supported workflow has no EasyTithe dependency. These CLI changes are local
+and unreleased. Opt-in read probes are in docs/provider-contracts.rst.
+Interactive Firefox login and private request-metadata inspection are described
+in docs/browser-inspection.rst. Browser tooling is development-only.
 
 Compatibility
 -------------

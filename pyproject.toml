@@ -23,15 +23,23 @@ classifiers = [
 Repository = "https://github.com/firestrand/pyBreezeChMS"
 Upstream = "https://github.com/alexortizrosado/pyBreezeChMS"
 
+[project.optional-dependencies]
+operator = [
+    "python-dotenv>=1.2.4,<2",
+]
+
+[project.scripts]
+breeze = "breeze.cli:main"
+
 [dependency-groups]
 dev = [
-  "easytithe",
   "pytest==9.1.1",
   "pytest-cov==7.1.0",
   "ruff==0.16.10",
   "ty==0.0.84",
   "types-requests==2.33.0.20260906",
   "pip-audit==2.10.1",
+  "websockets==17.1",
 ]
 
 [tool.setuptools]
@@ -55,10 +63,12 @@ ignore = ["E501"]
 python-version = "3.14"
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "samples/easytithe/tests"]
+testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
-addopts = ["--import-mode=importlib", "--strict-config", "--strict-markers"]
+addopts = ["--import-mode=importlib", "--strict-config", "--strict-markers", "--ignore=tests/legacy"]
 filterwarnings = ["error"]
+markers = ["live_provider: explicitly opted-in read-only authorized provider contract checks"]
 
-[tool.uv.sources]
-easytithe = { path = "samples/easytithe", editable = true }
+[tool.ty.src]
+# Archived website adapter/sample have their own optional verification scope.
+exclude = ["samples", "tests/legacy"]

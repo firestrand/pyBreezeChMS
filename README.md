@@ -23,7 +23,7 @@ import os
 from breeze import breeze
 
 with breeze.BreezeApi(
-    breeze_url="https://your_subdomain.breezechms.com",
+    breeze_url="https://your-subdomain.breezechms.com",
     api_key=os.environ["BREEZE_API_KEY"],
 ) as client:
     people = client.get_people()
@@ -31,11 +31,34 @@ with breeze.BreezeApi(
 
 The client owns its default session. Injected connections stay caller-owned
 and must implement the `HttpConnection` protocol, including streaming responses.
-Requests use verified TLS, a 60-second inactivity timeout, no redirects or
+Requests share 3.5-second account pacing within one process, use verified TLS,
+a 60-second inactivity timeout and per-request elapsed budget, no redirects or
 retries, and a 16 MiB response limit (`max_response_bytes` is configurable).
 Paginate large result sets. `dry_run=True` returns `None` without making Breeze
 requests, including contribution operations. HTTP failures, malformed responses,
 and API errors raise `BreezeError` with sanitized messages and chained causes.
+The elapsed budget is checked before dispatch, after return, during streaming,
+and after decoding. Requests cannot forcibly interrupt a blocked synchronous
+call or DNS lookup; this is budget enforcement, not instantaneous cancellation.
+`RateLimiter` can be explicitly injected and shared; the default in-process
+registry retains at most 128 account hosts, with no credentials, and fails
+rather than resetting a quota window when full. Independent processes must use
+one coordinated account worker. `request_timeout` and `operation_timeout` are
+finite positive constructor options. Specific transport/deadline, HTTP,
+authentication, rate-limit and response errors remain subclasses of BreezeError.
+Debug diagnostics contain one event per non-dry-run operation: a fixed outcome
+category, count and elapsed seconds, including pacing time. Validation failures
+before dispatch are operations, not HTTP attempts. No request values or exception
+text are included; debug logging remains off unless the caller enables it.
+
+`iter_people` yields validated Person records with page/item bounds, raising on
+partial traversal rather than claiming completion. Offset traversal is not a
+snapshot of changing data. `add_allocated_contribution` accepts FundAllocation
+records containing exact Decimal amounts, computes the total without rounding,
+and preserves raw contribution methods. Allocations are bounded to 1000 entries
+and 1000 representation digits per amount; account currency and precision remain
+caller policy.
+
 Query values are encoded individually. Endpoint constants are now `StrEnum`
 values that continue to work as strings. The legacy `make_enum` utility remains
 available but no longer mutates caller-owned method mappings.
@@ -47,45 +70,48 @@ versions are `>=2.34.2,<3`; the lock records all exact development versions.
 ## Development and verification
 
 ```sh
-git clone --recurse-submodules https://github.com/firestrand/pyBreezeChMS.git
+git clone https://github.com/firestrand/pyBreezeChMS.git
 cd pyBreezeChMS
-uv sync --locked --group dev
+uv sync --locked --group dev --extra operator
 scripts/check.sh
 scripts/check-artifacts.sh
 ```
 
 The shared gate checks formatting, lint, types, offline tests, dependency
-vulnerabilities, and wheel/sdist builds. Artifact checks install both distributions
+vulnerabilities, and wheel/sdist builds. Artifact checks install the core distribution
 in a clean environment outside the checkout. The standards audit and migration
 notes are in [docs/maintenance.rst](docs/maintenance.rst).
+Opt-in read-only provider checks and capture requirements are documented in
+[docs/provider-contracts.rst](docs/provider-contracts.rst). Default CI stays offline.
+The supported workflow and schemas are in [docs/data-exchange.rst](docs/data-exchange.rst).
 
-## EasyTithe importer
+## Data exchange and reviewed imports
 
-The `samples/easytithe` Git submodule is the Python 3.14 replacement maintained at
-[firestrand/easytithe](https://github.com/firestrand/easytithe). Its original
-login/export HTTP contract is verified with offline fixtures; live service
-availability has not been checked. Logging in configures the account's Custom
-export format when needed, matching the original adapter's behavior.
+The installed `breeze` CLI provides provider-independent contribution CSV input,
+offline preview, read-only planning, explicit reviewed apply, durable SQLite
+recovery, and versioned CSV/JSON Lines exports. No EasyTithe account, package,
+submodule, or dev tools are needed by installed workflows.
 
-Set `EASYTITHE_USERNAME`, `EASYTITHE_PASSWORD`, and `BREEZE_API_KEY` in the runtime
-environment, then run:
+For this unreleased worktree, install `.[operator]` or use the development sync
+above. Populate the ignored `.env` with `BREEZE_URL` and `BREEZE_API_KEY`, using
+[.env.example](.env.example) as the field reference. Offline preview needs neither:
 
 ```sh
-uv run --locked python samples/easytithe_importer.py \
-  --breeze_url https://your_subdomain.breezechms.com \
-  --start_date 10/01/2026 --end_date 10/03/2026 --dry_run
+uv run --locked breeze preview \
+  --source examples/contributions-v1.csv --policy examples/import-policy.json
+uv run --locked breeze export people --details --output .breeze-runs/people.jsonl
 ```
 
-Remove `--dry_run` to import. Dry-run downloads and validates the report but makes
-no Breeze requests. The importer matches exact case-insensitive names, skips
-existing contributions for matching people, rejects ambiguous names, and imports
-unmatched rows anonymously. Secrets and individual records are excluded from
-logs. CLI credentials have been replaced by environment variables. Financial
-records are validated before the first write. Review matches and date ranges
-before importing; anonymous records do not have a stable person ID for duplicate
-checks. Duplicate detection preserves the original same-person/date/amount
-heuristic; distinct gifts with those same values may be skipped. Importing is sequential and does not roll back earlier successful writes
-if a later record fails. No automatic retry is performed.
+Currency/precision, fund mappings, date windows and journal retention are explicit
+run inputs. Ambiguous/unmatched donors and possible duplicates require review;
+unresolved plans cannot apply. Confirm the exact plan digest before writes. Any
+uncertain submission requires reconciliation, never automatic replay. Outputs
+are private and complete-only. See the data-exchange guide for schemas, exits,
+recovery and adapter boundaries. Public releases do not yet include these changes.
+
+The previous EasyTithe sample/submodule remain historical optional code. They
+are excluded from core verification and have not been live-verified. New adapters
+should produce the common contribution records and reuse planning/recovery.
 
 ## How do I make a contribution?
 Never made an open source contribution before? Wondering how contributions work in the in our project? Here's a quick rundown!

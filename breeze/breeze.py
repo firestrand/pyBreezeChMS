@@ -20,12 +20,25 @@ __author__ = "alexortizrosado@gmail.com (Alex Ortiz-Rosado)"
 import json
 import logging
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from decimal import Decimal, localcontext
 from enum import StrEnum
 from typing import Protocol
 from urllib.parse import quote, urlsplit
 
 import requests
+
+from .errors import (
+    BreezeAuthenticationError,
+    BreezeDeadlineError,
+    BreezeError,
+    BreezeHttpError,
+    BreezeRateLimitError,
+    BreezeResponseError,
+    BreezeTransportError,
+)
+from .models import FundAllocation, Person
+from .policy import RateLimiter, account_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +96,7 @@ def _json_value(value: object) -> JsonValue:
         return [_json_value(item) for item in value]
     if isinstance(value, dict) and all(isinstance(key, str) for key in value):
         return {str(key): _json_value(item) for key, item in value.items()}
-    raise BreezeError("Invalid JSON value in API response.")
-
-
-class BreezeError(Exception):
-    """Exception for BreezeApi."""
-
-    pass
+    raise BreezeResponseError("Invalid JSON value in API response.")
 
 
 def _validate_json_array(value: str) -> None:
@@ -103,6 +110,18 @@ def _validate_json_array(value: str) -> None:
         raise BreezeError("JSON request parameter must be an array of objects.")
 
 
+def _giving_query(fields: Mapping[str, str | int | float | None]) -> str:
+    """Preserve giving endpoint omission/ordering rules in one serializer."""
+    params: list[str] = []
+    for key, value in fields.items():
+        if value is None or (not value and key != "amount"):
+            continue
+        if key == "funds_json" and isinstance(value, str):
+            _validate_json_array(value)
+        params.append(f"{key}={quote(str(value), safe='')}")
+    return "&".join(params)
+
+
 class BreezeApi:
     """A wrapper for the Breeze REST API."""
 
@@ -114,6 +133,9 @@ class BreezeApi:
         connection: HttpConnection | None = None,
         *,
         max_response_bytes: int = 16 * 1024 * 1024,
+        rate_limiter: RateLimiter | None = None,
+        request_timeout: float = 60,
+        operation_timeout: float = 60,
     ) -> None:
         """Create a client for an HTTPS Breeze subdomain.
 
@@ -151,12 +173,23 @@ class BreezeApi:
             or "\n" in api_key
         ):
             raise BreezeError("Provide a nonempty API key without newlines.")
-        if max_response_bytes < 1:
-            raise ValueError("max_response_bytes must be positive.")
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes < 1
+        ):
+            raise ValueError("max_response_bytes must be a positive integer.")
+        if any(
+            not math.isfinite(value) or value <= 0 for value in (request_timeout, operation_timeout)
+        ):
+            raise ValueError("Request and operation timeouts must be finite and positive.")
         self.breeze_url = f"https://{host}"
         self.api_key = api_key
         self.dry_run = dry_run
         self.max_response_bytes = max_response_bytes
+        self.rate_limiter = account_limiter(host, api_key) if rate_limiter is None else rate_limiter
+        self.request_timeout = request_timeout
+        self.operation_timeout = operation_timeout
         self._owns_connection = connection is None
         self.connection: HttpConnection = requests.Session() if connection is None else connection
 
@@ -165,52 +198,100 @@ class BreezeApi:
         endpoint: str,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        timeout: float = 60,
+        timeout: float | None = None,
+    ) -> JsonValue:
+        """Record fixed categories/counts/timing without sensitive request data."""
+        if self.dry_run:
+            return self._perform_request(endpoint, params, headers, timeout)
+        started = self.rate_limiter.clock()
+        outcome = "other_failure"
+        try:
+            result = self._perform_request(endpoint, params, headers, timeout)
+            outcome = "success"
+            return result
+        except BreezeError as error:
+            # Ordered because deadline/auth/rate errors subclass broader errors.
+            categories = (
+                (BreezeDeadlineError, "deadline"),
+                (BreezeAuthenticationError, "authentication"),
+                (BreezeRateLimitError, "rate_limit"),
+                (BreezeHttpError, "http"),
+                (BreezeTransportError, "transport"),
+                (BreezeResponseError, "response"),
+            )
+            outcome = next(
+                (category for error_type, category in categories if isinstance(error, error_type)),
+                "validation",
+            )
+            raise
+        finally:
+            logger.debug(
+                "Breeze operation outcome=%s count=1 elapsed_seconds=%.3f",
+                outcome,
+                max(0.0, self.rate_limiter.clock() - started),
+            )
+
+    def _perform_request(
+        self,
+        endpoint: str,
+        params: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ) -> JsonValue:
         """Make one bounded request without retrying writes or following redirects."""
         request_headers = dict(headers or {})
         request_headers.update({"Content-Type": "application/json", "Api-Key": self.api_key})
+        timeout = self.request_timeout if timeout is None else timeout
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive.")
         if len(endpoint.encode("utf-8")) > 64 * 1024:
             raise BreezeError("Breeze request exceeds the 64 KiB URL limit.")
         if self.dry_run:
             return None
-        # Query values may contain names, financial data, or contact information.
-        logger.debug("Making Breeze request")
+        deadline = self.rate_limiter.clock() + self.operation_timeout
+        self.rate_limiter.wait(deadline)
         try:
             response = self.connection.get(
                 f"{self.breeze_url}{endpoint}",
                 verify=True,
                 params=params or {},
                 headers=request_headers,
-                timeout=timeout,
+                timeout=min(timeout, self.rate_limiter.remaining(deadline)),
                 stream=True,
                 allow_redirects=False,
             )
         except requests.RequestException as error:
-            raise BreezeError("Breeze connection failed.") from error
+            raise BreezeTransportError("Breeze connection failed.") from error
         try:
+            self.rate_limiter.remaining(deadline)
             if not 200 <= response.status_code < 300:
-                raise BreezeError(f"Breeze returned HTTP {response.status_code}.")
+                if response.status_code in (401, 403):
+                    raise BreezeAuthenticationError(response.status_code)
+                if response.status_code == 429:
+                    raise BreezeRateLimitError(response.status_code)
+                raise BreezeHttpError(response.status_code)
             content = bytearray()
             try:
                 for chunk in response.iter_content(chunk_size=64 * 1024):
+                    self.rate_limiter.remaining(deadline)
                     if len(content) + len(chunk) > self.max_response_bytes:
-                        raise BreezeError("Breeze response exceeds the configured size limit.")
+                        raise BreezeResponseError(
+                            "Breeze response exceeds the configured size limit."
+                        )
                     content.extend(chunk)
             except requests.RequestException as error:
-                raise BreezeError("Failed to read Breeze response.") from error
+                raise BreezeTransportError("Failed to read Breeze response.") from error
             try:
                 decoded: object = json.loads(content)
             except (ValueError, UnicodeDecodeError, RecursionError) as error:
-                raise BreezeError("Breeze returned invalid JSON.") from error
+                raise BreezeResponseError("Breeze returned invalid JSON.") from error
             try:
                 result = _json_value(decoded)
             except RecursionError as error:
-                raise BreezeError("Breeze response JSON is too deeply nested.") from error
+                raise BreezeResponseError("Breeze response JSON is too deeply nested.") from error
             if not self._request_succeeded(result):
-                raise BreezeError("Breeze reported an API error.")
+                raise BreezeResponseError("Breeze reported an API error.")
+            self.rate_limiter.remaining(deadline)
             return result
         finally:
             response.close()
@@ -239,10 +320,15 @@ class BreezeApi:
         if response is None and self.dry_run:
             return None
         if not isinstance(response, dict):
-            raise BreezeError("Invalid payment response.")
+            raise BreezeResponseError("Invalid payment response.")
         payment_id = response.get("payment_id")
-        if isinstance(payment_id, bool) or not isinstance(payment_id, (str, int)):
-            raise BreezeError("Missing or invalid payment ID.")
+        if (
+            isinstance(payment_id, bool)
+            or not isinstance(payment_id, (str, int))
+            or isinstance(payment_id, str)
+            and not payment_id.strip()
+        ):
+            raise BreezeResponseError("Missing or invalid payment ID.")
         return payment_id
 
     def get_account_summary(self) -> JsonValue:
@@ -313,6 +399,67 @@ class BreezeApi:
         if details:
             params.append("details=1")
         return self._request("{}/?{}".format(ENDPOINTS.PEOPLE, "&".join(params)))
+
+    def iter_people_records(
+        self,
+        *,
+        page_size: int = 100,
+        max_pages: int = 1000,
+        max_items: int = 100_000,
+        details: bool = False,
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Bounded raw people traversal retaining vendor fields for exporters."""
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (page_size, max_pages, max_items)
+        ):
+            raise ValueError("Pagination limits must be positive integers.")
+        if self.dry_run:
+            return
+        seen: set[str] = set()
+        offset = 0
+        for _ in range(max_pages):
+            response = self.get_people(limit=page_size, offset=offset, details=details)
+            if not isinstance(response, list) or len(response) > page_size:
+                raise BreezeResponseError("Invalid people page.")
+            if not response:
+                return
+            page: list[tuple[Person, dict[str, JsonValue]]] = []
+            for value in response:
+                person = Person.from_json(value)
+                if not isinstance(value, dict):
+                    raise BreezeResponseError("Invalid people record.")
+                page.append((person, value))
+            for person, value in page:
+                identifier = str(person.id)
+                if identifier in seen:
+                    raise BreezeResponseError("People pagination repeated an identifier.")
+                if len(seen) >= max_items:
+                    raise BreezeResponseError("People pagination item limit exceeded.")
+                seen.add(identifier)
+                yield value
+            if len(page) < page_size:
+                return
+            offset += len(page)
+        raise BreezeResponseError("People pagination page limit exceeded.")
+
+    def iter_people(
+        self,
+        *,
+        page_size: int = 100,
+        max_pages: int = 1000,
+        max_items: int = 100_000,
+        details: bool = False,
+    ) -> Iterator[Person]:
+        """Yield validated people; consume completely before permitting writes.
+
+        Offset pagination is not a snapshot of changing provider data. Raw
+        fields remain available through iter_people_records for exporters.
+        """
+        for value in self.iter_people_records(
+            page_size=page_size, max_pages=max_pages, max_items=max_items, details=details
+        ):
+            yield Person.from_json(value)
 
     def get_profile_fields(self) -> JsonValue:
         """List profile fields from your database.
@@ -560,32 +707,71 @@ class BreezeApi:
         Throws:
           BreezeError on failure to add contribution."""
 
-        params = []
-        if date:
-            params.append("date={}".format(quote(str(date), safe="")))
-        if name:
-            params.append("name={}".format(quote(str(name), safe="")))
-        if person_id:
-            params.append("person_id={}".format(quote(str(person_id), safe="")))
-        if uid:
-            params.append("uid={}".format(quote(str(uid), safe="")))
-        if processor:
-            params.append("processor={}".format(quote(str(processor), safe="")))
-        if method:
-            params.append("method={}".format(quote(str(method), safe="")))
-        if funds_json:
-            _validate_json_array(funds_json)
-            params.append("funds_json={}".format(quote(str(funds_json), safe="")))
-        if amount is not None:
-            params.append("amount={}".format(quote(str(amount), safe="")))
-        if group:
-            params.append("group={}".format(quote(str(group), safe="")))
-        if batch_number:
-            params.append("batch_number={}".format(quote(str(batch_number), safe="")))
-        if batch_name:
-            params.append("batch_name={}".format(quote(str(batch_name), safe="")))
-        response = self._request("{}/add?{}".format(ENDPOINTS.CONTRIBUTIONS, "&".join(params)))
+        query = _giving_query(
+            {
+                "date": date,
+                "name": name,
+                "person_id": person_id,
+                "uid": uid,
+                "processor": processor,
+                "method": method,
+                "funds_json": funds_json,
+                "amount": amount,
+                "group": group,
+                "batch_number": batch_number,
+                "batch_name": batch_name,
+            }
+        )
+        response = self._request(f"{ENDPOINTS.CONTRIBUTIONS}/add?{query}")
         return self._payment_id(response)
+
+    def add_allocated_contribution(
+        self,
+        funds: Iterable[FundAllocation],
+        *,
+        date: str,
+        person_id: Identifier | None = None,
+        name: str | None = None,
+        uid: Identifier | None = None,
+        processor: str | None = None,
+        method: str | None = None,
+        group: str | None = None,
+        batch_name: str | None = None,
+    ) -> Identifier | None:
+        """Serialize validated fund allocations and derive the exact total.
+
+        Materialization is locally bounded to 1000 allocations. This helper
+        does not select an account currency or round caller amounts.
+        """
+        allocations: list[FundAllocation] = []
+        for allocation in funds:
+            if len(allocations) >= 1000:
+                raise ValueError("Fund allocation limit exceeded.")
+            allocations.append(allocation)
+        if not allocations:
+            raise ValueError("At least one fund allocation is required.")
+        integers = max(max(allocation.amount.adjusted() + 1, 1) for allocation in allocations)
+        fractions = 0
+        for allocation in allocations:
+            exponent = allocation.amount.as_tuple().exponent
+            if not isinstance(exponent, int):
+                raise ValueError("Fund amounts must be finite.")
+            fractions = max(fractions, -exponent)
+        with localcontext() as context:
+            context.prec = integers + fractions + len(str(len(allocations))) + 2
+            total = sum((allocation.amount for allocation in allocations), Decimal(0))
+        return self.add_contribution(
+            date=date,
+            person_id=person_id,
+            name=name,
+            uid=uid,
+            processor=processor,
+            method=method,
+            group=group,
+            batch_name=batch_name,
+            funds_json=json.dumps([allocation.to_json() for allocation in allocations]),
+            amount=format(total, "f"),
+        )
 
     def edit_contribution(
         self,
@@ -660,33 +846,23 @@ class BreezeApi:
         Throws:
           BreezeError on failure to edit contribution."""
 
-        params = []
-        if payment_id:
-            params.append("payment_id={}".format(quote(str(payment_id), safe="")))
-        if date:
-            params.append("date={}".format(quote(str(date), safe="")))
-        if name:
-            params.append("name={}".format(quote(str(name), safe="")))
-        if person_id:
-            params.append("person_id={}".format(quote(str(person_id), safe="")))
-        if uid:
-            params.append("uid={}".format(quote(str(uid), safe="")))
-        if processor:
-            params.append("processor={}".format(quote(str(processor), safe="")))
-        if method:
-            params.append("method={}".format(quote(str(method), safe="")))
-        if funds_json:
-            _validate_json_array(funds_json)
-            params.append("funds_json={}".format(quote(str(funds_json), safe="")))
-        if amount is not None:
-            params.append("amount={}".format(quote(str(amount), safe="")))
-        if group:
-            params.append("group={}".format(quote(str(group), safe="")))
-        if batch_number:
-            params.append("batch_number={}".format(quote(str(batch_number), safe="")))
-        if batch_name:
-            params.append("batch_name={}".format(quote(str(batch_name), safe="")))
-        response = self._request("{}/edit?{}".format(ENDPOINTS.CONTRIBUTIONS, "&".join(params)))
+        query = _giving_query(
+            {
+                "payment_id": payment_id,
+                "date": date,
+                "name": name,
+                "person_id": person_id,
+                "uid": uid,
+                "processor": processor,
+                "method": method,
+                "funds_json": funds_json,
+                "amount": amount,
+                "group": group,
+                "batch_number": batch_number,
+                "batch_name": batch_name,
+            }
+        )
+        response = self._request(f"{ENDPOINTS.CONTRIBUTIONS}/edit?{query}")
         return self._payment_id(response)
 
     def delete_contribution(self, payment_id: Identifier) -> Identifier | None:
@@ -707,6 +883,16 @@ class BreezeApi:
             )
         )
         return self._payment_id(response)
+
+    def list_forms(self, is_archived: bool = False) -> JsonValue:
+        """Discover active or archived forms using the published read endpoint."""
+        return self._request(f"{ENDPOINTS.FORMS}/list_forms?is_archived={int(is_archived)}")
+
+    def list_form_fields(self, form_id: Identifier) -> JsonValue:
+        """Discover fields before interpreting form-entry responses."""
+        return self._request(
+            f"{ENDPOINTS.FORMS}/list_form_fields?form_id={quote(str(form_id), safe='')}"
+        )
 
     def list_form_entries(self, form_id: Identifier, details: bool = False) -> JsonValue:
         """return entries for the given form

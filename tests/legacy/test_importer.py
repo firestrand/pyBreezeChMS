@@ -13,7 +13,7 @@ from breeze.breeze import BreezeApi, BreezeError, HttpResponse
 
 # The sample is deliberately not part of the published Breeze package.
 _spec = importlib.util.spec_from_file_location(
-    "easytithe_importer", Path(__file__).parents[1] / "samples" / "easytithe_importer.py"
+    "easytithe_importer", Path(__file__).parents[2] / "samples" / "easytithe_importer.py"
 )
 assert _spec is not None and _spec.loader is not None
 _importer = importlib.util.module_from_spec(_spec)
